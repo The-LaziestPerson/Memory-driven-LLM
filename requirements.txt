@@ -1,0 +1,3 @@
+streamlit>=1.30
+networkx>=3.2
+pyvis>=0.3.2

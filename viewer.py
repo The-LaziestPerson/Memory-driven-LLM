@@ -216,7 +216,7 @@ def render_graph(G: nx.DiGraph, show_topics: List[int], show_claim_edges: bool):
 st.set_page_config(layout="wide")
 st.title("Semantic Claim Graph Explorer")
 
-path = st.sidebar.text_input("Path to JSON", value="integrated_graph.json")
+path = st.sidebar.text_input("Path to JSON", value="integrated_graph_revision.json")
 
 if not os.path.exists(path):
     st.error("File not found.")
@@ -286,3 +286,4 @@ try:
     os.remove(tmp_path)
 except Exception:
     pass
+

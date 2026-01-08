@@ -1,0 +1,369 @@
+{
+  "params": {
+    "depth": 4,
+    "branch": 1,
+    "same_threshold": 0.7,
+    "related_threshold": 0.5,
+    "model_name": "EleutherAI/pythia-1.4b",
+    "dataset_authoritative": true,
+    "use_lora": true,
+    "lora_path": "checkpoints/dpo_epoch1",
+    "gnn_ckpt": "checkpoints/gnn_epoch1.pt",
+    "encoder": "sentence-transformers/all-mpnet-base-v2",
+    "log_prompts": true,
+    "inject_gnn": true
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": 0,
+        "text": "Let person A walk at speed v = 5 km/h; they reach the park in t = 30 minutes.",
+        "created_at": 1767417339.2336285,
+        "provenance": [
+          {
+            "topic_idx": 0,
+            "raw_node_id": 0,
+            "source_text": "Let person A walk at speed v = 5 km/h; they reach the park in t = 30 minutes.",
+            "time": 1767417339.2336285
+          }
+        ],
+        "confidence": 0.5,
+        "support_weight": 0.08,
+        "attack_weight": 0.0,
+        "status": "ACTIVE",
+        "revised_by": null
+      },
+      {
+        "id": 1,
+        "text": "Prior is involved in this process.",
+        "created_at": 1767417339.2408538,
+        "provenance": [
+          {
+            "topic_idx": 0,
+            "raw_node_id": 1,
+            "source_text": "Prior is involved in this process.",
+            "time": 1767417339.2408538
+          },
+          {
+            "topic_idx": 1,
+            "raw_node_id": 1,
+            "source_text": "Prior is involved in this process.",
+            "time": 1767417339.255357
+          },
+          {
+            "topic_idx": 2,
+            "raw_node_id": 1,
+            "source_text": "Prior is involved in this process.",
+            "time": 1767417339.2648485
+          },
+          {
+            "topic_idx": 3,
+            "raw_node_id": 1,
+            "source_text": "Prior is involved in this process.",
+            "time": 1767417339.275344
+          },
+          {
+            "topic_idx": 4,
+            "raw_node_id": 1,
+            "source_text": "Prior is involved in this process.",
+            "time": 1767417339.287102
+          },
+          {
+            "topic_idx": 5,
+            "raw_node_id": 1,
+            "source_text": "Prior is involved in this process.",
+            "time": 1767417339.3003373
+          }
+        ],
+        "confidence": 0.5,
+        "support_weight": 3.08,
+        "attack_weight": 0.0,
+        "status": "ACTIVE",
+        "revised_by": null
+      },
+      {
+        "id": 2,
+        "text": "A glass of water at temperature T = 25°C feels cool to hand H when touched.",
+        "created_at": 1767417339.2496076,
+        "provenance": [
+          {
+            "topic_idx": 1,
+            "raw_node_id": 0,
+            "source_text": "A glass of water at temperature T = 25°C feels cool to hand H when touched.",
+            "time": 1767417339.2496076
+          }
+        ],
+        "confidence": 0.5,
+        "support_weight": 0.08,
+        "attack_weight": 0.0,
+        "status": "ACTIVE",
+        "revised_by": null
+      },
+      {
+        "id": 3,
+        "text": "Car C travels distance d = 100 km with fuel consumption f = 7 L/100km.",
+        "created_at": 1767417339.262846,
+        "provenance": [
+          {
+            "topic_idx": 2,
+            "raw_node_id": 0,
+            "source_text": "Car C travels distance d = 100 km with fuel consumption f = 7 L/100km.",
+            "time": 1767417339.2611043
+          }
+        ],
+        "confidence": 0.5,
+        "support_weight": 0.08,
+        "attack_weight": 0.0,
+        "status": "ACTIVE",
+        "revised_by": null
+      },
+      {
+        "id": 4,
+        "text": "Plant P absorbs sunlight S and carbon dioxide CO2 to produce oxygen O2.",
+        "created_at": 1767417339.2723398,
+        "provenance": [
+          {
+            "topic_idx": 3,
+            "raw_node_id": 0,
+            "source_text": "Plant P absorbs sunlight S and carbon dioxide CO2 to produce oxygen O2.",
+            "time": 1767417339.2723398
+          }
+        ],
+        "confidence": 0.5,
+        "support_weight": 0.08,
+        "attack_weight": 0.0,
+        "status": "ACTIVE",
+        "revised_by": null
+      },
+      {
+        "id": 5,
+        "text": "Ball B dropped from height h = 2 m hits the ground in time t ≈ 0.64 s.",
+        "created_at": 1767417339.283095,
+        "provenance": [
+          {
+            "topic_idx": 4,
+            "raw_node_id": 0,
+            "source_text": "Ball B dropped from height h = 2 m hits the ground in time t ≈ 0.64 s.",
+            "time": 1767417339.283095
+          }
+        ],
+        "confidence": 0.5,
+        "support_weight": 0.08,
+        "attack_weight": 0.0,
+        "status": "ACTIVE",
+        "revised_by": null
+      },
+      {
+        "id": 6,
+        "text": "Sound wave W with frequency f = 440 Hz is heard by ear E as musical note A.",
+        "created_at": 1767417339.296596,
+        "provenance": [
+          {
+            "topic_idx": 5,
+            "raw_node_id": 0,
+            "source_text": "Sound wave W with frequency f = 440 Hz is heard by ear E as musical note A.",
+            "time": 1767417339.296596
+          }
+        ],
+        "confidence": 0.5,
+        "support_weight": 0.08,
+        "attack_weight": 0.0,
+        "status": "ACTIVE",
+        "revised_by": null
+      }
+    ],
+    "edges": [
+      {
+        "source": 0,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "created_at": 1767417339.24386
+      },
+      {
+        "source": 2,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "created_at": 1767417339.255357
+      },
+      {
+        "source": 3,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "created_at": 1767417339.2648485
+      },
+      {
+        "source": 4,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "created_at": 1767417339.275344
+      },
+      {
+        "source": 5,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "created_at": 1767417339.287102
+      },
+      {
+        "source": 6,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "created_at": 1767417339.3003373
+      }
+    ],
+    "events": [
+      {
+        "event": "add_node",
+        "id": 0,
+        "text": "Let person A walk at speed v = 5 km/h; they reach the park in t = 30 minutes.",
+        "time": 1767417339.2336285
+      },
+      {
+        "event": "add_node",
+        "id": 1,
+        "text": "Prior is involved in this process.",
+        "time": 1767417339.2408538
+      },
+      {
+        "event": "add_edge",
+        "source": 0,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "time": 1767417339.24386
+      },
+      {
+        "event": "add_node",
+        "id": 2,
+        "text": "A glass of water at temperature T = 25°C feels cool to hand H when touched.",
+        "time": 1767417339.2496076
+      },
+      {
+        "event": "merge",
+        "id": 1,
+        "prov": {
+          "topic_idx": 1,
+          "raw_node_id": 1,
+          "source_text": "Prior is involved in this process.",
+          "time": 1767417339.255357
+        },
+        "time": 1767417339.255357
+      },
+      {
+        "event": "add_edge",
+        "source": 2,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "time": 1767417339.255357
+      },
+      {
+        "event": "add_node",
+        "id": 3,
+        "text": "Car C travels distance d = 100 km with fuel consumption f = 7 L/100km.",
+        "time": 1767417339.262846
+      },
+      {
+        "event": "merge",
+        "id": 1,
+        "prov": {
+          "topic_idx": 2,
+          "raw_node_id": 1,
+          "source_text": "Prior is involved in this process.",
+          "time": 1767417339.2648485
+        },
+        "time": 1767417339.2648485
+      },
+      {
+        "event": "add_edge",
+        "source": 3,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "time": 1767417339.2648485
+      },
+      {
+        "event": "add_node",
+        "id": 4,
+        "text": "Plant P absorbs sunlight S and carbon dioxide CO2 to produce oxygen O2.",
+        "time": 1767417339.2723398
+      },
+      {
+        "event": "merge",
+        "id": 1,
+        "prov": {
+          "topic_idx": 3,
+          "raw_node_id": 1,
+          "source_text": "Prior is involved in this process.",
+          "time": 1767417339.275344
+        },
+        "time": 1767417339.275344
+      },
+      {
+        "event": "add_edge",
+        "source": 4,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "time": 1767417339.275344
+      },
+      {
+        "event": "add_node",
+        "id": 5,
+        "text": "Ball B dropped from height h = 2 m hits the ground in time t ≈ 0.64 s.",
+        "time": 1767417339.283095
+      },
+      {
+        "event": "merge",
+        "id": 1,
+        "prov": {
+          "topic_idx": 4,
+          "raw_node_id": 1,
+          "source_text": "Prior is involved in this process.",
+          "time": 1767417339.287102
+        },
+        "time": 1767417339.287102
+      },
+      {
+        "event": "add_edge",
+        "source": 5,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "time": 1767417339.287102
+      },
+      {
+        "event": "add_node",
+        "id": 6,
+        "text": "Sound wave W with frequency f = 440 Hz is heard by ear E as musical note A.",
+        "time": 1767417339.296596
+      },
+      {
+        "event": "merge",
+        "id": 1,
+        "prov": {
+          "topic_idx": 5,
+          "raw_node_id": 1,
+          "source_text": "Prior is involved in this process.",
+          "time": 1767417339.3003373
+        },
+        "time": 1767417339.3003373
+      },
+      {
+        "event": "add_edge",
+        "source": 6,
+        "target": 1,
+        "type": "derived",
+        "score": 1.0,
+        "time": 1767417339.3003373
+      }
+    ],
+    "pattern_stats": {}
+  },
+  "generated_at": 1767417339.3003373
+}

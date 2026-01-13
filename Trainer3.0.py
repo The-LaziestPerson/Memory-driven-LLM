@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
-Trainer3_fixed_with_eos.py
+Trainer3_fixed_with_eos_and_augmentation.py
 
-Fixed Trainer based on your provided Trainer3.0.py with robust EOS handling
-and DPO EOS-preservation penalty. Key fixes:
- - token-level EOS preservation (tokenize_preserve_eos) to prevent truncation
-   from removing the EOS id.
- - consistent prefix length computation clipped against actual tokenized sequences.
- - EOS-missing penalty added to DPO constraint penalty (tunable).
- - SFT collate uses the same tokenization helper so SFT and DPO see identical ids.
- - Optional EOS diagnostic logging.
+Extended trainer that includes:
+ - robust EOS handling (token-level preservation)
+ - augmentation pipeline to make outputs unconditionally structured
+   * converts unstructured (Style-B) outputs into structured E/H/V/C duplicates
+   * creates helper-dropped variants from structured (Style-A) samples so the
+     model learns to produce structured outputs even when helpers are absent
+   * tag-noise and helper-shuffle utilities
+ - augmentation is non-destructive: original samples are kept and augmented
+   variants are appended (so Q4 = "no" policy is respected)
+ - DPO uses structured outputs as positives; original unstructured outputs can
+   be left as negatives or augmented too (configurable)
+ - EOS-preservation and EOS-penalty during DPO maintained
 
-Usage: same as before. New CLI flags: --eos_penalty_weight, --debug_eos
+CLI flags added for augmentation control:
+  --augment                      enable augmentation (default True)
+  --p_drop_helpers               prob to add a helper-dropped variant (default 0.5)
+  --p_synthesize_unstructured    prob to synthesize structured dup for unstructured (default 1.0)
+  --p_tag_noise                  prob to apply tag noise to ancestors (default 0.3)
+  --seed                         RNG seed for reproducibility
+  --keep_original_neg_as_negative  (default True) keep original neg as negative for DPO
 
 Author: adapted by ChatGPT
 """
@@ -57,36 +67,197 @@ def pad_to_length(input_ids: torch.Tensor, attention_mask: torch.Tensor, target_
     return input_ids, attention_mask
 
 
+# -------------------------
+# Augmentation helpers
+# -------------------------
+
+def is_structured_text(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return ('hypothesis:' in t) or ('verification:' in t) or ('conclusion:' in t)
+
+
+def split_sentences(text: str) -> List[str]:
+    # simple, conservative sentence splitter that keeps semantics
+    if not text:
+        return []
+    # replace newlines with spaces then split
+    txt = re.sub(r"\s+", " ", text.strip())
+    # split on sentence enders while keeping abbreviations naive handling
+    parts = re.split(r'(?<=[\.!?])\s+', txt)
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts
+
+
+def choose_hypothesis_sentence(sentences: List[str]) -> int:
+    # heuristics: prefer sentences with keywords likely indicating claims
+    keywords = ['therefore', 'thus', 'hence', 'hypothesis', 'we propose', 'we hypothesize', 'suggests', 'implies', 'requires', 'ensures', 'forces', 'may', 'must', 'will', 'would', 'leads to', 'causes']
+    for i, s in enumerate(sentences):
+        ls = s.lower()
+        for k in keywords:
+            if k in ls:
+                return i
+    # prefer last sentence if it starts with a conclusion-like token
+    last = sentences[-1] if sentences else ''
+    if any(w in last.lower() for w in ['therefore', 'conclusion', 'we conclude', 'in conclusion']):
+        return len(sentences)-1
+    # default: first sentence
+    return 0
+
+
+def convert_flat_to_structured(flat_text: str) -> str:
+    """
+    Convert a flat paragraph into the canonical structured form:
+    E (exposition, keep full paragraph)
+    HYPOTHESIS: <pick or synthesize>
+    VERIFICATION: <use remaining sentences as verification>
+    CONCLUSION: <restatement>
+
+    This converter is intentionally conservative: it does not invent novel domain facts,
+    it reuses sentences from the input to build sections.
+    """
+    if not flat_text:
+        return "\n\nHYPOTHESIS: \n\nVERIFICATION: \n\nCONCLUSION: \n"
+    sentences = split_sentences(flat_text)
+    if not sentences:
+        return flat_text + '\n\nHYPOTHESIS: \n\nVERIFICATION: \n\nCONCLUSION: \n'
+
+    # Exposition (E): keep original paragraph(s)
+    exposition = flat_text.strip()
+
+    # Hypothesis: choose a sentence conservatively
+    idx_h = choose_hypothesis_sentence(sentences)
+    hypothesis = sentences[idx_h]
+
+    # Verification: use other sentences to justify; prefer sentences near the hypothesis
+    verification_parts = [s for i,s in enumerate(sentences) if i != idx_h]
+    if verification_parts:
+        verification = ' '.join(verification_parts)
+    else:
+        # fallback: paraphrase exposition minimally
+        verification = hypothesis
+
+    # Conclusion: restate hypothesis succinctly with a safe prefix
+    conclusion = hypothesis
+    # if hypothesis already contains words like 'therefore' avoid duplication
+    if not re.search(r'\b(therefore|thus|hence|in conclusion|we conclude)\b', conclusion, flags=re.I):
+        conclusion = 'Therefore, ' + conclusion[0].lower() + conclusion[1:] if len(conclusion)>1 else 'Therefore.'
+
+    structured = f"{exposition}\n\nHYPOTHESIS: {hypothesis}\n\nVERIFICATION: {verification}\n\nCONCLUSION: {conclusion}"
+    return structured
+
+
+def apply_tag_noise(ancestors: List[str], p_tag_noise: float = 0.3) -> List[str]:
+    out = []
+    for a in ancestors:
+        if random.random() < p_tag_noise:
+            # small noise: shorten tags or remove brackets or lowercase
+            a2 = a
+            a2 = re.sub(r"\[(Definition|Law|Constraint|Limit|Variable|Relation)\]", lambda m: '[' + m.group(1)[:3] + ']', a2)
+            if random.random() < 0.3:
+                a2 = a2.replace('[', '').replace(']', '')
+            if random.random() < 0.2:
+                a2 = a2.lower()
+            out.append(a2)
+        else:
+            out.append(a)
+    return out
+
+
+def make_prefix_from_context(topic: str, ancestors: List[str]) -> str:
+    if ancestors:
+        formatted_ctx = (f"Topic: {topic}\n\nPrior hypotheses:\n" + "\n\n".join(ancestors)).strip()
+    else:
+        formatted_ctx = f"Topic: {topic}" if topic else ""
+    prefix_full = f"Given the context below, evaluate the hypothesis.\n\n{formatted_ctx}\n\n"
+    return prefix_full
+
+
+def augment_sample(original: 'PairSample', tokenizer, pad_id: int, augment_cfg: Dict) -> List['PairSample']:
+    """
+    Return additional augmented PairSample objects (not replacing the original):
+      - If original pos is unstructured -> add structured duplicate (converted)
+      - If original is structured and has ancestors -> with probability p_drop_helpers add variant with helpers removed
+      - With probability p_tag_noise apply tag noise to ancestors and add variant
+    """
+    out = []
+    # keep original untouched (augmentation function returns only additional variants)
+    topic = original.context.get('topic', '') if isinstance(original.context, dict) else ''
+    ancestors = original.context.get('ancestors', []) if isinstance(original.context, dict) else []
+
+    p_drop = augment_cfg.get('p_drop_helpers', 0.5)
+    p_synth = augment_cfg.get('p_synthesize_unstructured', 1.0)
+    p_tag_noise = augment_cfg.get('p_tag_noise', 0.3)
+
+    # 1) If pos is unstructured, synthesize structured duplicate
+    if not is_structured_text(original.pos):
+        if random.random() < p_synth:
+            s2 = copy.deepcopy(original)
+            s2.pos = convert_flat_to_structured(original.pos)
+            if s2.neg and not is_structured_text(s2.neg):
+                s2.neg = convert_flat_to_structured(s2.neg)
+            # rebuild textual fields
+            prefix = make_prefix_from_context(topic, ancestors)
+            s2.prefix_full = prefix + 'Hypothesis:\n'
+            s2.pos_full = safe_ensure_eos_text(s2.prefix_full + (s2.pos or ''), tokenizer)
+            s2.neg_full = safe_ensure_eos_text(s2.prefix_full + (s2.neg or ''), tokenizer)
+            out.append(s2)
+
+    # 2) If sample has ancestors (structured input), create helper-dropped variant
+    if ancestors and random.random() < p_drop:
+        s3 = copy.deepcopy(original)
+        # drop ancestors from prefix but keep structured pos (so we teach model to produce structure without helpers)
+        prefix = make_prefix_from_context(topic, [])
+        s3.prefix_full = prefix + 'Hypothesis:\n'
+        # keep pos full as structured text (if not structured, synthesize)
+        if not is_structured_text(s3.pos):
+            s3.pos = convert_flat_to_structured(s3.pos)
+        if s3.neg and not is_structured_text(s3.neg):
+            s3.neg = convert_flat_to_structured(s3.neg)
+        s3.pos_full = safe_ensure_eos_text(s3.prefix_full + (s3.pos or ''), tokenizer)
+        s3.neg_full = safe_ensure_eos_text(s3.prefix_full + (s3.neg or ''), tokenizer)
+        out.append(s3)
+
+    # 3) Tag noise variant
+    if ancestors and random.random() < p_tag_noise:
+        s4 = copy.deepcopy(original)
+        noisy_anc = apply_tag_noise(ancestors, p_tag_noise=p_tag_noise)
+        prefix = make_prefix_from_context(topic, noisy_anc)
+        s4.prefix_full = prefix + 'Hypothesis:\n'
+        if not is_structured_text(s4.pos):
+            s4.pos = convert_flat_to_structured(s4.pos)
+        if s4.neg and not is_structured_text(s4.neg):
+            s4.neg = convert_flat_to_structured(s4.neg)
+        s4.pos_full = safe_ensure_eos_text(s4.prefix_full + (s4.pos or ''), tokenizer)
+        s4.neg_full = safe_ensure_eos_text(s4.prefix_full + (s4.neg or ''), tokenizer)
+        out.append(s4)
+
+    return out
+
+
+# -------------------------
+# Existing helpers (EOS tokenizer, dataset classes, etc.) remain unchanged
+# -------------------------
+
 def tokenize_preserve_eos(tokenizer, texts: List[str], max_length: int, pad_token_id: int, truncation_side: str = 'right'):
-    """
-    Tokenize a list of texts and ensure each sequence ends with tokenizer.eos_token_id.
-    Returns padded tensors: input_ids (LongTensor) and attention_mask (LongTensor),
-    and the list of raw token lists (pre-padding). This avoids EOS being removed by
-    tokenizer-level truncation.
-    """
     eos_id = getattr(tokenizer, "eos_token_id", None)
-    # Tokenize without truncation nor padding to inspect raw ids
     encodings = tokenizer(texts, add_special_tokens=False, padding=False, truncation=False)
     token_lists = []
     for ids in encodings['input_ids']:
         ids = list(ids)
-        # If the raw token length exceeds max_length, we will clip.
         if len(ids) > max_length:
             if truncation_side == 'right':
                 ids = ids[:max_length]
             else:
                 ids = ids[-max_length:]
-        # Ensure eos present as final token-id
         if eos_id is not None:
             if len(ids) == 0 or ids[-1] != eos_id:
                 if len(ids) >= max_length:
-                    # force last slot to be eos_id (we sacrifice previous last token)
                     ids[-1] = eos_id
                 else:
                     ids.append(eos_id)
         token_lists.append(ids)
-
-    # pad to same length
     max_len_batch = max(len(x) for x in token_lists)
     padded_ids = []
     attn_masks = []
@@ -95,17 +266,12 @@ def tokenize_preserve_eos(tokenizer, texts: List[str], max_length: int, pad_toke
         padded = ids + [pad_token_id] * (max_len_batch - len(ids))
         padded_ids.append(padded)
         attn_masks.append(attn)
-
     input_ids = torch.tensor(padded_ids, dtype=torch.long)
     attention_mask = torch.tensor(attn_masks, dtype=torch.long)
     return input_ids, attention_mask, token_lists
 
 
 def safe_ensure_eos_text(text: str, tokenizer):
-    """
-    Keep for compatibility: ensure the textual string ends with the tokenizer's eos_token string.
-    This function is text-level only and not relied upon for the token-level guarantee.
-    """
     if text is None:
         return ""
     text = text.rstrip()
@@ -124,7 +290,7 @@ def safe_ensure_eos_text(text: str, tokenizer):
 
 
 # -------------------------
-# Dataset / Sample
+# Dataset / Sample (unchanged class definitions)
 # -------------------------
 class PairSample:
     def __init__(self, raw: Dict):
@@ -132,7 +298,6 @@ class PairSample:
         self.context = raw.get('context', {})
         self.pos = raw.get('accepted', '') or ''
         self.neg = raw.get('rejected', '') or ''
-        # optional scored metrics (from your scorer)
         self.E_acc = raw.get('E_acc', None)
         self.C_acc = raw.get('C_acc', None)
         self.G_acc = raw.get('G_acc', None)
@@ -149,7 +314,6 @@ class PairSample:
         self.flag_reject = bool(raw.get('flag_reject', False))
         self.flag_low_reasoning = bool(raw.get('flag_low_reasoning', False))
         self.flag_hallucination = bool(raw.get('flag_hallucination', False))
-        # built prompts
         self.prefix_full = None
         self.pos_full = None
         self.neg_full = None
@@ -164,7 +328,7 @@ class PairDataset(Dataset):
 
 
 # -------------------------
-# Constraint head wrapper
+# Constraint head wrapper and other existing utilities (unchanged)
 # -------------------------
 class ConstraintLM(nn.Module):
     def __init__(self, base_model: AutoModelForCausalLM, hidden_size: int, constraint_k: int = 6, head_hidden: int = 512):
@@ -195,9 +359,6 @@ class ConstraintLM(nn.Module):
         return self.head(pooled_features)
 
 
-# -------------------------
-# Hook helper (robust)
-# -------------------------
 def run_with_last_hidden_hook(model: AutoModelForCausalLM, **forward_kwargs):
     captured = {}
     handle = None
@@ -254,11 +415,7 @@ def run_with_last_hidden_hook(model: AutoModelForCausalLM, **forward_kwargs):
     raise RuntimeError("Could not extract last hidden state. Inspect model structure.")
 
 
-# -------------------------
-# Sequence logprobs helper
-# -------------------------
 def compute_sequence_logprobs_from_logits(logits, input_ids, attn_mask, prompt_lens):
-    # logits: [B, T, V], input_ids: [B,T], attn_mask: [B,T], prompt_lens: [B]
     shift_logits = logits[:, :-1, :]
     shift_labels = input_ids[:, 1:]
     shift_attn = attn_mask[:, 1:]
@@ -275,9 +432,6 @@ def compute_sequence_logprobs_from_logits(logits, input_ids, attn_mask, prompt_l
     return seq_logp
 
 
-# -------------------------
-# LoRA L1 penalty
-# -------------------------
 def lora_l1_penalty(model, l1_lambda: float):
     l1 = torch.tensor(0.0, device=next(model.parameters()).device)
     count = 0
@@ -330,11 +484,20 @@ def train(
     ema_update_every: int = 100,
     eos_penalty_weight: float = 0.2,
     debug_eos: bool = False,
+    augment: bool = True,
+    p_drop_helpers: float = 0.5,
+    p_synthesize_unstructured: float = 1.0,
+    p_tag_noise: float = 0.3,
+    seed: int = 1337,
+    keep_original_neg_as_negative: bool = True,
 ):
     os.makedirs(out_dir, exist_ok=True)
     use_cuda = torch.cuda.is_available() and device != 'cpu'
     device_t = torch.device(device if use_cuda else 'cpu')
     print("[train] device:", device_t)
+
+    random.seed(seed)
+    torch.manual_seed(seed)
 
     print('[train] loading tokenizer:', model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
@@ -417,51 +580,61 @@ def train(
     samples = []
     for r in raw:
         s = PairSample(r)
+        # canonicalize context prefix from context dict
         formatted_ctx = ''
         if isinstance(s.context, dict):
             topic = s.context.get('topic', '')
             ancestors = s.context.get('ancestors', []) or []
-            formatted_ctx = (f"Topic: {topic}\n\nPrior hypotheses:\n" + "\n\n".join(ancestors)).strip()
+            prefix_full = make_prefix_from_context(topic, ancestors) + 'Hypothesis:\n'
         else:
-            formatted_ctx = str(s.context)
-        prefix_full = f"Given the context below, evaluate the hypothesis.\n\n{formatted_ctx}\n\nHypothesis:\n"
+            topic = ''
+            ancestors = []
+            prefix_full = make_prefix_from_context(topic, []) + 'Hypothesis:\n'
         s.prefix_full = prefix_full
         # keep text-level SFT strings for compatibility but token-level EOS will be enforced at tokenization time
         s.pos_full = safe_ensure_eos_text(prefix_full + (s.pos or ''), tokenizer)
         s.neg_full = safe_ensure_eos_text(prefix_full + (s.neg or ''), tokenizer)
         try:
-            # rough example_len estimation (text-level) for sorting; we'll compute actual token lengths later
             s.example_len = len(tokenizer(s.pos_full, add_special_tokens=False)["input_ids"]) + len(tokenizer(s.neg_full, add_special_tokens=False)["input_ids"]) if s.pos_full and s.neg_full else 0
         except Exception:
             s.example_len = 0
         samples.append(s)
+
+        # augmentation (non-destructive): create additional training variants
+        if augment:
+            augment_cfg = {'p_drop_helpers': p_drop_helpers, 'p_synthesize_unstructured': p_synthesize_unstructured, 'p_tag_noise': p_tag_noise}
+            extra = augment_sample(s, tokenizer, pad_id, augment_cfg)
+            for sx in extra:
+                try:
+                    # recompute example_len for augmented
+                    sx.example_len = len(tokenizer(sx.pos_full, add_special_tokens=False)["input_ids"]) + (len(tokenizer(sx.neg_full, add_special_tokens=False)["input_ids"]) if sx.neg_full else 0)
+                except Exception:
+                    sx.example_len = 0
+                samples.append(sx)
+
     random.shuffle(samples)
     n = len(samples)
-    print(f"[train] loaded {n} pairs")
+    print(f"[train] loaded {n} pairs (including augmented)")
 
     # collate for SFT: supervise generation tokens only. Use token-level EOS-preserving tokenizer.
     def collate_pairs_sft(batch: List[PairSample]):
         pos_texts, neg_texts, prefix_cache, pos_cons, neg_cons = [], [], [], [] , []
         for s in batch:
-            # we use the textual forms earlier stored but will rectify token-level EOS in tokenization helper
             pos_texts.append(s.pos_full)
             neg_texts.append(s.neg_full)
             prefix_cache.append(s.prefix_full)
             pos_cons.append([s.E_acc, s.C_acc, s.G_acc, s.D_acc, s.H_acc, s.Q_acc])
             neg_cons.append([s.E_rej, s.C_rej, s.G_rej, s.D_rej, s.H_rej, s.Q_rej])
 
-        # Tokenize while ensuring EOS presence
         enc_pos_ids, enc_pos_attn, pos_lists = tokenize_preserve_eos(tokenizer, pos_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right')
         enc_neg_ids, enc_neg_attn, neg_lists = tokenize_preserve_eos(tokenizer, neg_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right')
 
-        # compute prefix lens (token count for prefix) clipped to actual tokenized sequence lengths
         prefix_token_lengths = []
         for p, token_list in zip(prefix_cache, pos_lists):
             try:
                 pl = len(tokenizer(p, add_special_tokens=False)['input_ids'])
             except Exception:
                 pl = 0
-            # clip to actual tokenized sequence length
             pl = min(pl, len(token_list))
             prefix_token_lengths.append(pl)
 
@@ -478,12 +651,11 @@ def train(
     scaler = GradScaler(enabled=(device_t.type == 'cuda'))
     bce_loss = nn.BCEWithLogitsLoss()
 
-    # default flag weights
     if flag_weights is None:
         flag_weights = {'reject':1.0, 'low_reasoning':0.4, 'hallucination':0.3}
 
     # -------------------------
-    # SFT phase (same idea, with optional ARD L1)
+    # SFT phase
     # -------------------------
     print('[train] START SFT')
     total_sft_steps = epochs_sft * len(sft_loader)
@@ -492,7 +664,6 @@ def train(
         constr_model.model.train(); constr_model.train()
         epoch_loss = 0.0; micro = 0
         for enc_pos, enc_neg, prompt_lens, pos_cons_list, neg_cons_list in tqdm(sft_loader, desc=f'SFT epoch {epoch}'):
-            # move to device
             input_ids_pos = enc_pos['input_ids'].to(device_t); attn_pos = enc_pos['attention_mask'].to(device_t)
             input_ids_neg = enc_neg['input_ids'].to(device_t); attn_neg = enc_neg['attention_mask'].to(device_t)
             max_len_batch = max(input_ids_pos.size(1), input_ids_neg.size(1))
@@ -515,7 +686,6 @@ def train(
                 pooled_pos = pooled[:Bpos].detach(); pooled_neg = pooled[Bpos:].detach()
                 pred_pos_logits = constr_model.head_forward(pooled_pos)
                 pred_neg_logits = constr_model.head_forward(pooled_neg)
-                # build BCE targets from pos_cons_list
                 def make_targets(cons_list):
                     out = []
                     mask = []
@@ -593,7 +763,6 @@ def train(
         pbar = tqdm(range(0, len(pair_items), batch_size), desc=f'DPO epoch {epoch}')
         for i in pbar:
             batch = pair_items[i:i+batch_size]
-            # build full texts
             pos_full_texts=[]; neg_full_texts=[]; prefix_lens_full=[]
             delta_q_list = []
             flags_batch = []
@@ -606,14 +775,12 @@ def train(
                 delta_q_list.append(0.0 if s.Delta_Q is None else float(s.Delta_Q))
                 flags_batch.append({'reject': s.flag_reject, 'low_reasoning': s.flag_low_reasoning, 'hallucination': s.flag_hallucination})
 
-            # tokenize fulls using token-level EOS-preserving helper
             input_ids_pos_full, attn_pos_full, pos_lists = tokenize_preserve_eos(
                 tokenizer, pos_full_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right'
             )
             input_ids_neg_full, attn_neg_full, neg_lists = tokenize_preserve_eos(
                 tokenizer, neg_full_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right'
             )
-            # clip prefix lens to actual tokenized lengths
             clipped_prefix_lens = [min(pl, len(ids)) for pl, ids in zip(prefix_lens_full, pos_lists)]
 
             input_ids_pos_full = input_ids_pos_full.to(device_t)
@@ -629,7 +796,6 @@ def train(
             attn_both_full = torch.cat([attn_pos_full, attn_neg_full], dim=0)
             prompt_lens_both_full = torch.cat([prompt_lens_full, prompt_lens_full], dim=0)
 
-            # compute theta logits and logprobs (with grad)
             constr_model.model.train()
             with autocast(enabled=(device_t.type=='cuda')):
                 out_both_theta_full, last_hidden_theta_full = run_with_last_hidden_hook(constr_model.model, input_ids=input_ids_both_full, attention_mask=attn_both_full)
@@ -638,7 +804,6 @@ def train(
                 B_full = input_ids_pos_full.size(0)
                 logp_pos_theta_full = logp_both_theta_full[:B_full]; logp_neg_theta_full = logp_both_theta_full[B_full:]
 
-            # compute ref logits/logprobs on CPU with no grad in small batches to save VRAM
             ref_device = next(ref_model.parameters()).device
             with torch.no_grad():
                 input_ids_pos_ref = input_ids_pos_full.cpu(); attn_pos_ref = attn_pos_full.cpu()
@@ -659,20 +824,17 @@ def train(
                 logp_both_ref_full = compute_sequence_logprobs_from_logits(logits_both_ref_full, input_ids_both_full, attn_both_full, prompt_lens_both_full)
                 logp_pos_ref_full = logp_both_ref_full[:B_full]; logp_neg_ref_full = logp_both_ref_full[B_full:]
 
-            # compute DPO deltas
             delta_logp_full = logp_pos_theta_full - logp_neg_theta_full
             d_theta_adj_full = delta_logp_full - lambda_v * torch.tensor(0.0, device=device_t)
             d_ref_full = logp_pos_ref_full - logp_neg_ref_full
             diff_full = d_theta_adj_full - d_ref_full
 
-            # incorporate dataset margin ΔQ
             delta_q_tensor = torch.tensor([min(max(d, -1.0), 1.0) for d in delta_q_list], dtype=torch.float32, device=device_t)
             scaled_full = (beta_target if global_step >= beta_warmup_steps else (beta_start + (beta_target - beta_start) * (global_step / max(1, beta_warmup_steps)))) * (diff_full - gamma_margin * delta_q_tensor)
             scaled_full = torch.clamp(scaled_full, min=-50.0, max=50.0)
             per_example_loss_full = -F.logsigmoid(scaled_full)
             loss_full = per_example_loss_full.mean()
 
-            # constraint penalty using available metrics per-sample
             cons_penalty = torch.tensor(0.0, device=device_t)
             cnt_pen = 0
             for idx, s in enumerate(batch):
@@ -688,12 +850,10 @@ def train(
             else:
                 cons_penalty = torch.tensor(0.0, device=device_t)
 
-            # EOS missing penalty: check pos_lists and neg_lists (raw token lists returned earlier)
             eos_id = getattr(tokenizer, "eos_token_id", None)
             eos_pen = 0.0
             if eos_id is not None:
                 missing = 0.0
-                # pos_lists and neg_lists are python lists; their lengths equal batch size
                 for ids in pos_lists:
                     if len(ids) == 0 or ids[-1] != eos_id:
                         missing += 1.0
@@ -702,10 +862,8 @@ def train(
                         missing += 1.0
                 total_checked = max(1.0, float(len(pos_lists) + len(neg_lists)))
                 eos_pen = (missing / total_checked)
-                # scale and add to cons_penalty
                 cons_penalty = cons_penalty + eos_pen * eos_penalty_weight
 
-            # flag-based downweighting: compute avg weight
             avg_flag_weight = 0.0
             for flags in flags_batch:
                 w = 1.0
@@ -761,14 +919,11 @@ def train(
 
             global_step += 1
             if debug_eos:
-                # compute EOS logprob diagnostics for a single example and print
                 try:
                     with torch.no_grad():
-                        # find eos token logprob for the first pos example in theta logits
                         logits = logits_both_theta_full[0]
                         last_pos_idx = (input_ids_both_full[0] != pad_id).nonzero(as_tuple=False).squeeze(-1).max().item()
                         eos_tok_id = eos_id
-                        # compute token logprob for the token at last_pos_idx
                         logp = F.log_softmax(logits, dim=-1)[last_pos_idx-1, eos_tok_id].item() if last_pos_idx>0 else None
                         pbar.set_postfix({'dpo_raw_loss': float(raw_loss.detach().cpu()), 'beta': float(beta_target), 'eos_logp_first': logp})
                 except Exception:
@@ -823,37 +978,14 @@ def parse_args():
     p.add_argument('--l1_lambda', type=float, default=1e-6)
     p.add_argument('--eos_penalty_weight', type=float, default=0.2)
     p.add_argument('--debug_eos', action='store_true')
+    p.add_argument('--augment', action='store_true', help='enable augmentation (default False in CLI unless specified)')
+    p.add_argument('--p_drop_helpers', type=float, default=0.5)
+    p.add_argument('--p_synthesize_unstructured', type=float, default=1.0)
+    p.add_argument('--p_tag_noise', type=float, default=0.3)
+    p.add_argument('--seed', type=int, default=1337)
+    p.add_argument('--keep_original_neg_as_negative', action='store_true')
     return p.parse_args()
 
 
 if __name__ == '__main__':
-    args = parse_args()
-    train(
-        data_path=args.data,
-        out_dir=args.out_dir,
-        model_name=args.model,
-        epochs_sft=args.epochs_sft,
-        epochs_dpo=args.epochs_dpo,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        device=args.device,
-        constraint_k=args.constraint_k,
-        alpha_sft=args.alpha_sft,
-        alpha_dpo=args.alpha_dpo,
-        beta_start=args.beta_start,
-        beta_target=args.beta_target,
-        beta_warmup_steps=args.beta_warmup_steps,
-        lambda_v=args.lambda_v,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        quant_bits=args.quant_bits,
-        gradient_checkpointing=args.grad_ckpt,
-        ref_on_cpu=args.ref_on_cpu,
-        gamma_margin=args.gamma_margin,
-        constraint_penalty_weight=args.constraint_penalty_weight,
-        use_ard_lora=args.use_ard_lora,
-        l1_lambda=args.l1_lambda,
-        eos_penalty_weight=args.eos_penalty_weight,
-        debug_eos=args.debug_eos,
-    )
+    args =

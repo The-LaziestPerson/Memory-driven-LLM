@@ -15,6 +15,9 @@ from __future__ import annotations
 import argparse, json, os, random, copy, time, warnings
 from typing import List, Any, Optional, Dict
 
+# HF cache defaults (adjust if you want)
+os.environ.setdefault('HF_HOME', './hf_cache')
+os.environ.setdefault("TRANSFORMERS_CACHE", "./hf_cache/transformers")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -847,7 +850,7 @@ def parse_args():
     p.add_argument('--lora_dropout', type=float, default=0.05)
     p.add_argument('--quant_bits', type=int, default=4, choices=[4,8,16])
     p.add_argument('--grad_ckpt', default=True)
-    p.add_argument('--ref_on_cpu', default=True)
+    p.add_argument('--ref_on_cpu', default=False)
     p.add_argument('--gamma_margin', type=float, default=1.0, help='scale of ΔQ margin inside DPO')
     p.add_argument('--constraint_penalty_weight', type=float, default=0.5)
     p.add_argument('--use_ard_lora', default=True, help='Enable ARD L1 on LoRA params')

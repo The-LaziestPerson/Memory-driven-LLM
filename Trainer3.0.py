@@ -1,36 +1,48 @@
 #!/usr/bin/env python3
 """
-Trainer3_fixed_full.py
+Trainer3.0.py
 
-Fixed Trainer (full) — SFT + DPO with robust EOS preservation.
-Key fixes:
- - reference snapshot taken after SFT (prevents DPO from erasing SFT behavior)
- - token-level EOS preservation (tokenize_preserve_eos)
- - separate prefix clipping for pos and neg
- - optional tokenwise KL anchor to keep theta close to ref on generation tokens
- - improved EOS diagnostics and safe guards
-Usage: same as previous trainer. See CLI flags (--help).
+A consolidated, VRAM-stable Trainer for your hypothesis-evaluation dataset.
+
+Key design goals:
+ - Use scored examples (Q_acc, Delta_Q, E/C/G/D/H flags) produced by your scorer.
+ - Reward-matching DPO: incorporate dataset margin ΔQ into DPO signal.
+ - Flag-guided weighting (downweight low-quality/hallucinated traces).
+ - VRAM-conscious ref model usage: keep ref on CPU (by default) and compute ref logits in small batches with no_grad.
+ - Optional ARD-style L1 on LoRA adapters.
+ - Backwards-compatible with Trainer2.0 CLI args but sane defaults favor stability.
+
+This variant includes EOS-aware DPO: EOS log-prob mass at final active position
+is added to sequence log-prob used in DPO, making termination a first-class
+term in the preference objective (Fix #2).
 """
 from __future__ import annotations
-import argparse, json, os, random, copy, time, warnings
-from typing import List, Any, Optional, Dict
+import argparse, json, os, random, copy, re, time
 
 # HF cache defaults (adjust if you want)
 os.environ.setdefault('HF_HOME', './hf_cache')
 os.environ.setdefault("TRANSFORMERS_CACHE", "./hf_cache/transformers")
+
+
+from typing import List, Tuple, Any, Optional, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
+# transformers / peft
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
+
+# AMP
 from torch.cuda.amp import autocast, GradScaler
 
 # -------------------------
-# Utils
+# Utilities
 # -------------------------
+
 def load_jsonl(path: str):
     out = []
     with open(path, 'r', encoding='utf-8') as f:
@@ -41,6 +53,7 @@ def load_jsonl(path: str):
             out.append(json.loads(line))
     return out
 
+
 def pad_to_length(input_ids: torch.Tensor, attention_mask: torch.Tensor, target_len: int, pad_token_id: int):
     cur_len = input_ids.size(1)
     if cur_len == target_len:
@@ -50,74 +63,38 @@ def pad_to_length(input_ids: torch.Tensor, attention_mask: torch.Tensor, target_
     attention_mask = F.pad(attention_mask, (0, pad_len), value=0)
     return input_ids, attention_mask
 
-def tokenize_preserve_eos(tokenizer, texts: List[str], max_length: int, pad_token_id: int, truncation_side: str = 'right'):
-    """
-    Tokenize a list of texts and ensure each sequence ends with tokenizer.eos_token_id.
-    Returns: input_ids tensor, attention_mask tensor, and raw token lists (pre-padding).
-    This avoids tokenizer truncation removing the eos id.
-    """
-    eos_id = getattr(tokenizer, "eos_token_id", None)
-    # Tokenize without truncation nor padding to inspect raw ids
-    encodings = tokenizer(texts, add_special_tokens=False, padding=False, truncation=False)
-    token_lists = []
-    for ids in encodings['input_ids']:
-        ids = list(ids)
-        # clip/truncate to max_length (raw token list) but reserve final slot for eos if possible
-        if len(ids) > max_length:
-            if truncation_side == 'right':
-                ids = ids[:max_length]
-            else:
-                ids = ids[-max_length:]
-        # ensure eos present as final token-id
-        if eos_id is not None:
-            if len(ids) == 0:
-                # create eos-only sequence
-                ids = [eos_id]
-            elif ids[-1] != eos_id:
-                if len(ids) >= max_length:
-                    # sacrifice last token to ensure eos fits
-                    ids[-1] = eos_id
-                else:
-                    ids.append(eos_id)
-        token_lists.append(ids)
-
-    # pad to same length
-    max_len_batch = max(len(x) for x in token_lists) if token_lists else 0
-    padded_ids = []
-    attn_masks = []
-    for ids in token_lists:
-        attn = [1] * len(ids) + [0] * (max_len_batch - len(ids))
-        padded = ids + [pad_token_id] * (max_len_batch - len(ids))
-        padded_ids.append(padded)
-        attn_masks.append(attn)
-    if padded_ids:
-        input_ids = torch.tensor(padded_ids, dtype=torch.long)
-        attention_mask = torch.tensor(attn_masks, dtype=torch.long)
-    else:
-        input_ids = torch.empty((0, 0), dtype=torch.long)
-        attention_mask = torch.empty((0, 0), dtype=torch.long)
-    return input_ids, attention_mask, token_lists
 
 def safe_ensure_eos_text(text: str, tokenizer):
-    """Text-level fallback: append eos token string if not present."""
+    """
+    Ensure the textual string ends with the tokenizer's eos_token string (not id).
+    Strategy:
+      - If tokenizer provides eos_token_id, tokenize with add_special_tokens=False and check last id.
+      - If last id == eos_id -> return original text.
+      - Else if tokenizer has an eos_token string -> append it and return.
+      - Else return original text.
+    This avoids inserting raw token ids into ids tensors directly and does not add new tokens.
+    """
     if text is None:
         return ""
     text = text.rstrip()
     eos_id = getattr(tokenizer, "eos_token_id", None)
     eos_tok = getattr(tokenizer, "eos_token", None)
+    # If we have eos_id, check last token id of tokenized sequence
     try:
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         if len(ids) > 0 and eos_id is not None and ids[-1] == eos_id:
             return text
     except Exception:
+        # tokenizer might error on weird input - fall through
         pass
     if eos_tok:
         if not text.endswith(eos_tok):
             return text + eos_tok
     return text
 
+
 # -------------------------
-# Data types
+# Dataset / Sample
 # -------------------------
 class PairSample:
     def __init__(self, raw: Dict):
@@ -125,6 +102,7 @@ class PairSample:
         self.context = raw.get('context', {})
         self.pos = raw.get('accepted', '') or ''
         self.neg = raw.get('rejected', '') or ''
+        # optional scored metrics (from your scorer)
         self.E_acc = raw.get('E_acc', None)
         self.C_acc = raw.get('C_acc', None)
         self.G_acc = raw.get('G_acc', None)
@@ -141,6 +119,7 @@ class PairSample:
         self.flag_reject = bool(raw.get('flag_reject', False))
         self.flag_low_reasoning = bool(raw.get('flag_low_reasoning', False))
         self.flag_hallucination = bool(raw.get('flag_hallucination', False))
+        # built prompts
         self.prefix_full = None
         self.pos_full = None
         self.neg_full = None
@@ -151,6 +130,7 @@ class PairDataset(Dataset):
         self.samples = samples
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
+
 
 # -------------------------
 # Constraint head wrapper
@@ -182,6 +162,7 @@ class ConstraintLM(nn.Module):
         return logits
     def head_forward(self, pooled_features):
         return self.head(pooled_features)
+
 
 # -------------------------
 # Hook helper (robust)
@@ -241,6 +222,7 @@ def run_with_last_hidden_hook(model: AutoModelForCausalLM, **forward_kwargs):
         return out, last
     raise RuntimeError("Could not extract last hidden state. Inspect model structure.")
 
+
 # -------------------------
 # Sequence logprobs helper
 # -------------------------
@@ -262,6 +244,43 @@ def compute_sequence_logprobs_from_logits(logits, input_ids, attn_mask, prompt_l
     return seq_logp
 
 # -------------------------
+# New EOS-aware helpers (Fix #2)
+# -------------------------
+def compute_eos_logps(logits, attn_mask, eos_id, clamp_min: float = -30.0, clamp_max: float = 0.0):
+    """
+    logits: [B, T, V]
+    attn_mask: [B, T]
+    eos_id: int
+    Returns: tensor [B] of log-prob for EOS at the final active position for each sample
+    """
+    B, T, V = logits.size()
+    device = logits.device
+    logprobs = torch.log_softmax(logits, dim=-1)  # [B,T,V]
+    eos_logps = torch.zeros((B,), dtype=logprobs.dtype, device=device)
+    for i in range(B):
+        if attn_mask is not None and attn_mask[i].sum() > 0:
+            active_idx = int(attn_mask[i].nonzero(as_tuple=False)[-1].item())
+        else:
+            active_idx = T - 1
+        active_idx = min(max(active_idx, 0), T - 1)
+        eos_logps[i] = logprobs[i, active_idx, eos_id]
+    # clamp for numeric safety
+    eos_logps = torch.clamp(eos_logps, min=clamp_min, max=clamp_max)
+    return eos_logps
+
+def compute_sequence_logprobs_with_eos(logits, input_ids, attn_mask, prompt_lens, eos_id, eos_coef: float = 1.0):
+    """
+    Returns seq_logp + eos_coef * eos_logp_at_final_position
+    (uses compute_sequence_logprobs_from_logits and compute_eos_logps)
+    """
+    seq_logp = compute_sequence_logprobs_from_logits(logits, input_ids, attn_mask, prompt_lens)
+    if eos_coef is None or eos_coef == 0.0:
+        return seq_logp
+    eos_logps = compute_eos_logps(logits, attn_mask, eos_id)
+    return seq_logp + eos_coef * eos_logps
+
+
+# -------------------------
 # LoRA L1 penalty
 # -------------------------
 def lora_l1_penalty(model, l1_lambda: float):
@@ -278,8 +297,9 @@ def lora_l1_penalty(model, l1_lambda: float):
         return torch.tensor(0.0, device=next(model.parameters()).device)
     return l1 * l1_lambda
 
+
 # -------------------------
-# Trainer
+# Trainer (design + implementation)
 # -------------------------
 def train(
     data_path: str,
@@ -307,15 +327,13 @@ def train(
     quant_bits: int = 4,
     gradient_checkpointing: bool = True,
     ref_on_cpu: bool = True,
-    grad_accum_steps: int = 8,
+    grad_accum_steps: int = 4,
     gamma_margin: float = 1.0,
     constraint_penalty_weight: float = 1.0,
     flag_weights: Dict[str, float] = None,
     ema_decay: float = 0.999,
     ema_update_every: int = 100,
-    eos_penalty_weight: float = 0.2,
-    debug_eos: bool = False,
-    anchor_coeff: float = 0.01,   # token-KL anchor coefficient (0 to disable)
+    eos_coef: float = 1.0,   # <-- new param: how strongly to weight EOS logp in DPO
 ):
     os.makedirs(out_dir, exist_ok=True)
     use_cuda = torch.cuda.is_available() and device != 'cpu'
@@ -325,9 +343,10 @@ def train(
     print('[train] loading tokenizer:', model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
     pad_id = tokenizer.pad_token_id if getattr(tokenizer, 'pad_token_id', None) is not None else (tokenizer.eos_token_id or 0)
-    eos_id = getattr(tokenizer, "eos_token_id", None)
-    if pad_id == eos_id:
-        warnings.warn("pad_token_id equals eos_token_id — padding will be indistinguishable from EOS. Consider setting a distinct pad token.")
+    eos_id = getattr(tokenizer, 'eos_token_id', None)
+    if eos_id is None:
+        print("[train] WARNING: tokenizer has no eos_token_id; disabling EOS term in DPO.")
+        eos_coef = 0.0
 
     def make_bnb_config(bits: int):
         if bits == 16 or bits is None:
@@ -388,6 +407,18 @@ def train(
     constr_model = ConstraintLM(peft_model, hidden_size=hidden_size, constraint_k=constraint_k)
     constr_model.head = constr_model.head.to(device_t)
 
+    # reference model: deepcopy base model weights; keep on CPU if requested
+    print('[train] creating reference model (deepcopy)')
+    ref_model = copy.deepcopy(constr_model.model)
+    try:
+        ref_device = 'cpu' if ref_on_cpu else device_t
+        ref_model.to(ref_device)
+    except Exception:
+        pass
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
+
     # load data
     print('[train] loading dataset:', data_path)
     raw = load_jsonl(data_path)
@@ -403,19 +434,15 @@ def train(
             formatted_ctx = str(s.context)
         prefix_full = f"Given the context below, evaluate the hypothesis.\n\n{formatted_ctx}\n\nHypothesis:\n"
         s.prefix_full = prefix_full
-        # text-level fallback (we rely on token-level tokenizer for true EOS enforcement)
-        s.pos_full = safe_ensure_eos_text(prefix_full + (s.pos or ''), tokenizer)
-        s.neg_full = safe_ensure_eos_text(prefix_full + (s.neg or ''), tokenizer)
-        try:
-            s.example_len = len(tokenizer(s.pos_full, add_special_tokens=False)["input_ids"]) + len(tokenizer(s.neg_full, add_special_tokens=False)["input_ids"]) if s.pos_full and s.neg_full else 0
-        except Exception:
-            s.example_len = 0
+        s.pos_full = prefix_full + safe_ensure_eos_text(s.pos or '', tokenizer)
+        s.neg_full = prefix_full + safe_ensure_eos_text(s.neg or '', tokenizer)
+        s.example_len = len(tokenizer(s.pos_full, add_special_tokens=False)["input_ids"]) + len(tokenizer(s.neg_full, add_special_tokens=False)["input_ids"]) if s.pos_full and s.neg_full else 0
         samples.append(s)
     random.shuffle(samples)
     n = len(samples)
     print(f"[train] loaded {n} pairs")
 
-    # collate for SFT: use token-level EOS-preserving tokenizer and compute prefix_lens for pos/neg separately
+    # collate for SFT: supervise generation tokens only
     def collate_pairs_sft(batch: List[PairSample]):
         pos_texts, neg_texts, prefix_cache, pos_cons, neg_cons = [], [], [], [] , []
         for s in batch:
@@ -424,28 +451,12 @@ def train(
             prefix_cache.append(s.prefix_full)
             pos_cons.append([s.E_acc, s.C_acc, s.G_acc, s.D_acc, s.H_acc, s.Q_acc])
             neg_cons.append([s.E_rej, s.C_rej, s.G_rej, s.D_rej, s.H_rej, s.Q_rej])
-
-        enc_pos_ids, enc_pos_attn, pos_lists = tokenize_preserve_eos(tokenizer, pos_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right')
-        enc_neg_ids, enc_neg_attn, neg_lists = tokenize_preserve_eos(tokenizer, neg_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right')
-
-        # compute prefix lens per side and clip to each tokenized sequence length
-        prefix_lens_pos = []
-        prefix_lens_neg = []
-        for p, pos_tok, neg_tok in zip(prefix_cache, pos_lists, neg_lists):
-            try:
-                pl = len(tokenizer(p, add_special_tokens=False)['input_ids'])
-            except Exception:
-                pl = 0
-            prefix_lens_pos.append(min(pl, len(pos_tok)))
-            prefix_lens_neg.append(min(pl, len(neg_tok)))
-
-        # For SFT collate, we'll return prompt_lens as two tensors (pos then neg)
-        prompt_lens_pos = torch.tensor(prefix_lens_pos, dtype=torch.long)
-        prompt_lens_neg = torch.tensor(prefix_lens_neg, dtype=torch.long)
-
-        enc_pos = {'input_ids': enc_pos_ids, 'attention_mask': enc_pos_attn}
-        enc_neg = {'input_ids': enc_neg_ids, 'attention_mask': enc_neg_attn}
-        return enc_pos, enc_neg, prompt_lens_pos, prompt_lens_neg, pos_cons, neg_cons
+        enc_pos = tokenizer(pos_texts, padding=True, truncation=True, max_length=max_len, return_tensors='pt')
+        enc_neg = tokenizer(neg_texts, padding=True, truncation=True, max_length=max_len, return_tensors='pt')
+        enc_pos = enc_pos; enc_neg = enc_neg
+        prefix_token_lengths = [len(tokenizer(p, add_special_tokens=False)["input_ids"]) for p in prefix_cache]
+        prompt_lens = torch.tensor(prefix_token_lengths, dtype=torch.long)
+        return enc_pos, enc_neg, prompt_lens, pos_cons, neg_cons
 
     sft_loader = DataLoader(PairDataset(samples), batch_size=batch_size, shuffle=True, collate_fn=collate_pairs_sft)
 
@@ -454,11 +465,12 @@ def train(
     scaler = GradScaler(enabled=(device_t.type == 'cuda'))
     bce_loss = nn.BCEWithLogitsLoss()
 
+    # default flag weights
     if flag_weights is None:
         flag_weights = {'reject':1.0, 'low_reasoning':0.4, 'hallucination':0.3}
 
     # -------------------------
-    # SFT phase
+    # SFT phase (same idea, with optional ARD L1)
     # -------------------------
     print('[train] START SFT')
     total_sft_steps = epochs_sft * len(sft_loader)
@@ -466,31 +478,21 @@ def train(
     for epoch in range(1, epochs_sft+1):
         constr_model.model.train(); constr_model.train()
         epoch_loss = 0.0; micro = 0
-        for enc_pos, enc_neg, prompt_lens_pos, prompt_lens_neg, pos_cons_list, neg_cons_list in tqdm(sft_loader, desc=f'SFT epoch {epoch}'):
+        for enc_pos, enc_neg, prompt_lens, pos_cons_list, neg_cons_list in tqdm(sft_loader, desc=f'SFT epoch {epoch}'):
             input_ids_pos = enc_pos['input_ids'].to(device_t); attn_pos = enc_pos['attention_mask'].to(device_t)
             input_ids_neg = enc_neg['input_ids'].to(device_t); attn_neg = enc_neg['attention_mask'].to(device_t)
-
-            # make both same width
             max_len_batch = max(input_ids_pos.size(1), input_ids_neg.size(1))
             input_ids_pos, attn_pos = pad_to_length(input_ids_pos, attn_pos, max_len_batch, pad_id)
             input_ids_neg, attn_neg = pad_to_length(input_ids_neg, attn_neg, max_len_batch, pad_id)
-
             input_ids_both = torch.cat([input_ids_pos, input_ids_neg], dim=0)
             attn_both = torch.cat([attn_pos, attn_neg], dim=0)
             labels_both = input_ids_both.clone()
             Bpos = input_ids_pos.size(0)
-
-            # create prompt lens for pos and neg then combine
-            prompt_lens_pos = prompt_lens_pos.to(device_t)
-            prompt_lens_neg = prompt_lens_neg.to(device_t)
-            prompt_lens_both = torch.cat([prompt_lens_pos, prompt_lens_neg], dim=0)
-
-            # mask prompt tokens in labels
+            prompt_lens_both = torch.cat([prompt_lens, prompt_lens], dim=0).to(device_t)
             for idx in range(labels_both.size(0)):
                 plen = int(prompt_lens_both[idx].item())
                 if plen > 0:
                     labels_both[idx, :plen] = -100
-
             with autocast(enabled=(device_t.type=='cuda')):
                 out_both, last_hidden = run_with_last_hidden_hook(constr_model.model, input_ids=input_ids_both, attention_mask=attn_both, labels=labels_both)
                 lm_loss_pos = out_both.loss
@@ -499,19 +501,18 @@ def train(
                 pooled_pos = pooled[:Bpos].detach(); pooled_neg = pooled[Bpos:].detach()
                 pred_pos_logits = constr_model.head_forward(pooled_pos)
                 pred_neg_logits = constr_model.head_forward(pooled_neg)
-
-                # build BCE constraint targets
+                # build BCE targets from pos_cons_list
                 def make_targets(cons_list):
                     out = []
-                    mask_t = []
+                    mask = []
                     for item in cons_list:
                         if item is None:
-                            out.append([0.0]*constraint_k); mask_t.append(0.0)
+                            out.append([0.0]*constraint_k); mask.append(0.0)
                         else:
+                            # item contains [E,C,G,D,H,Q]
                             v = list(item[:constraint_k]) if isinstance(item, (list,tuple)) else [0.0]*constraint_k
-                            out.append([float(x or 0.0) for x in v]); mask_t.append(1.0)
-                    return torch.tensor(out, dtype=pred_pos_logits.dtype, device=pred_pos_logits.device), torch.tensor(mask_t, dtype=torch.float32, device=pred_pos_logits.device)
-
+                            out.append([float(x or 0.0) for x in v]); mask.append(1.0)
+                    return torch.tensor(out, dtype=pred_pos_logits.dtype, device=pred_pos_logits.device), torch.tensor(mask, dtype=torch.float32, device=pred_pos_logits.device)
                 tgt_pos, mask_pos = make_targets(pos_cons_list)
                 tgt_neg, mask_neg = make_targets(neg_cons_list)
                 cons_loss = torch.tensor(0., device=device_t, dtype=pred_pos_logits.dtype)
@@ -526,12 +527,10 @@ def train(
                     cons_loss = cons_loss / cnt
                 else:
                     cons_loss = torch.tensor(0., device=device_t)
-
                 curr_alpha_sft = alpha_sft
                 raw_loss = lm_loss_pos + curr_alpha_sft * cons_loss
                 if use_ard_lora and l1_lambda > 0:
                     raw_loss = raw_loss + lora_l1_penalty(constr_model, l1_lambda)
-
             if not torch.isfinite(raw_loss):
                 optimizer.zero_grad(set_to_none=True); continue
             loss_to_backward = raw_loss / max(1, grad_accum_steps)
@@ -553,34 +552,19 @@ def train(
                     torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-
         print(f"[SFT] epoch {epoch} avg_loss={(epoch_loss/max(1,micro)):.6f}")
         epoch_dir = os.path.join(out_dir, f"sft_epoch{epoch}")
         os.makedirs(epoch_dir, exist_ok=True)
         try:
-            # save adapters + tokenizer + head
-            constr_model.model.save_pretrained(epoch_dir)
-            tokenizer.save_pretrained(epoch_dir)
+            constr_model.model.save_pretrained(epoch_dir); tokenizer.save_pretrained(epoch_dir)
             torch.save({'head_state': constr_model.head.state_dict()}, os.path.join(epoch_dir, 'constraint_head.pt'))
         except Exception:
             torch.save({k:v.cpu() for k,v in constr_model.state_dict().items()}, os.path.join(epoch_dir, 'full_state.pt'))
 
-    # --- CRITICAL: create reference snapshot from SFT snapshot (instead of earlier) ---
-    print('[train] creating reference model (deepcopy) from SFT snapshot')
-    ref_model = copy.deepcopy(constr_model.model)
-    try:
-        ref_device = 'cpu' if ref_on_cpu else device_t
-        ref_model.to(ref_device)
-    except Exception:
-        pass
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad = False
-
     # -------------------------
-    # DPO phase
+    # DPO phase: reward-matching with ΔQ margin (EOS-aware)
     # -------------------------
-    print('[train] START DPO')
+    print('[train] START DPO (EOS-aware)')
     constr_model.model.eval(); constr_model.eval()
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-2)
 
@@ -597,62 +581,50 @@ def train(
         for i in pbar:
             batch = pair_items[i:i+batch_size]
             # build full texts
-            pos_full_texts=[]; neg_full_texts=[]; prefix_lens_full_pos=[]; prefix_lens_full_neg=[]
+            pos_full_texts=[]; neg_full_texts=[]; prefix_lens_full=[]
             delta_q_list = []
             flags_batch = []
             for s in batch:
                 pos_full_texts.append(s.pos_full); neg_full_texts.append(s.neg_full)
-                try:
-                    pl = len(tokenizer(s.prefix_full, add_special_tokens=False)['input_ids'])
-                except Exception:
-                    pl = 0
-                prefix_lens_full_pos.append(pl)
-                prefix_lens_full_neg.append(pl)
+                prefix_lens_full.append(len(tokenizer(s.prefix_full, add_special_tokens=False)['input_ids']))
                 delta_q_list.append(0.0 if s.Delta_Q is None else float(s.Delta_Q))
                 flags_batch.append({'reject': s.flag_reject, 'low_reasoning': s.flag_low_reasoning, 'hallucination': s.flag_hallucination})
-
-            # tokenize fulls using token-level EOS-preserving helper
-            input_ids_pos_full, attn_pos_full, pos_lists = tokenize_preserve_eos(
-                tokenizer, pos_full_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right'
-            )
-            input_ids_neg_full, attn_neg_full, neg_lists = tokenize_preserve_eos(
-                tokenizer, neg_full_texts, max_length=max_len, pad_token_id=pad_id, truncation_side='right'
-            )
-
-            # clip prefix lens to side-specific tokenized lengths
-            clipped_prefix_lens_pos = [min(pl, len(ids)) for pl, ids in zip(prefix_lens_full_pos, pos_lists)]
-            clipped_prefix_lens_neg = [min(pl, len(ids)) for pl, ids in zip(prefix_lens_full_neg, neg_lists)]
-
-            input_ids_pos_full = input_ids_pos_full.to(device_t); attn_pos_full = attn_pos_full.to(device_t)
-            input_ids_neg_full = input_ids_neg_full.to(device_t); attn_neg_full = attn_neg_full.to(device_t)
-            prompt_lens_full_pos = torch.tensor(clipped_prefix_lens_pos, dtype=torch.long, device=device_t)
-            prompt_lens_full_neg = torch.tensor(clipped_prefix_lens_neg, dtype=torch.long, device=device_t)
-
+            # tokenize fulls
+            enc_pos_full = tokenizer(pos_full_texts, padding=True, truncation=True, max_length=max_len, return_tensors='pt')
+            enc_neg_full = tokenizer(neg_full_texts, padding=True, truncation=True, max_length=max_len, return_tensors='pt')
+            input_ids_pos_full = enc_pos_full['input_ids'].to(device_t); attn_pos_full = enc_pos_full['attention_mask'].to(device_t)
+            input_ids_neg_full = enc_neg_full['input_ids'].to(device_t); attn_neg_full = enc_neg_full['attention_mask'].to(device_t)
+            prompt_lens_full = torch.tensor(prefix_lens_full, dtype=torch.long, device=device_t)
             max_len_full = max(input_ids_pos_full.size(1), input_ids_neg_full.size(1))
             input_ids_pos_full, attn_pos_full = pad_to_length(input_ids_pos_full, attn_pos_full, max_len_full, pad_id)
             input_ids_neg_full, attn_neg_full = pad_to_length(input_ids_neg_full, attn_neg_full, max_len_full, pad_id)
-
             input_ids_both_full = torch.cat([input_ids_pos_full, input_ids_neg_full], dim=0)
             attn_both_full = torch.cat([attn_pos_full, attn_neg_full], dim=0)
-            prompt_lens_both_full = torch.cat([prompt_lens_full_pos, prompt_lens_full_neg], dim=0)
+            prompt_lens_both_full = torch.cat([prompt_lens_full, prompt_lens_full], dim=0)
 
             # compute theta logits and logprobs (with grad)
             constr_model.model.train()
             with autocast(enabled=(device_t.type=='cuda')):
                 out_both_theta_full, last_hidden_theta_full = run_with_last_hidden_hook(constr_model.model, input_ids=input_ids_both_full, attention_mask=attn_both_full)
                 logits_both_theta_full = out_both_theta_full.logits
-                logp_both_theta_full = compute_sequence_logprobs_from_logits(logits_both_theta_full, input_ids_both_full, attn_both_full, prompt_lens_both_full)
+                # <-- REPLACED: include EOS term into the seq logprobs used by DPO
+                logp_both_theta_full = compute_sequence_logprobs_with_eos(
+                    logits_both_theta_full, input_ids_both_full, attn_both_full, prompt_lens_both_full,
+                    eos_id=eos_id, eos_coef=eos_coef
+                )
                 B_full = input_ids_pos_full.size(0)
                 logp_pos_theta_full = logp_both_theta_full[:B_full]; logp_neg_theta_full = logp_both_theta_full[B_full:]
 
             # compute ref logits/logprobs on CPU with no grad in small batches to save VRAM
             ref_device = next(ref_model.parameters()).device
             with torch.no_grad():
+                # prepare concatenated pos+neg on CPU-sized batches
                 input_ids_pos_ref = input_ids_pos_full.cpu(); attn_pos_ref = attn_pos_full.cpu()
                 input_ids_neg_ref = input_ids_neg_full.cpu(); attn_neg_ref = attn_neg_full.cpu()
                 input_ids_both_ref = torch.cat([input_ids_pos_ref, input_ids_neg_ref], dim=0)
                 attn_both_ref = torch.cat([attn_pos_ref, attn_neg_ref], dim=0)
 
+                # process in finer chunks to keep memory low
                 ref_batch_size = max(1, 4)
                 logits_ref_list = []
                 for start in range(0, input_ids_both_ref.size(0), ref_batch_size):
@@ -663,19 +635,22 @@ def train(
                     logits_chunk = out_ref.logits.detach().cpu()
                     logits_ref_list.append(logits_chunk)
                 logits_both_ref_full = torch.cat(logits_ref_list, dim=0).to(device_t)
-                logp_both_ref_full = compute_sequence_logprobs_from_logits(logits_both_ref_full, input_ids_both_full, attn_both_full, prompt_lens_both_full)
+                # <-- REPLACED: include EOS term in ref sequence logprobs as well
+                logp_both_ref_full = compute_sequence_logprobs_with_eos(
+                    logits_both_ref_full, input_ids_both_full, attn_both_full, prompt_lens_both_full,
+                    eos_id=eos_id, eos_coef=eos_coef
+                )
                 logp_pos_ref_full = logp_both_ref_full[:B_full]; logp_neg_ref_full = logp_both_ref_full[B_full:]
 
             # compute DPO deltas
             delta_logp_full = logp_pos_theta_full - logp_neg_theta_full
-            d_theta_adj_full = delta_logp_full - lambda_v * torch.tensor(0.0, device=device_t)
+            d_theta_adj_full = delta_logp_full - lambda_v * torch.tensor(0.0, device=device_t)  # lambda_v reserved if you use value proxy
             d_ref_full = logp_pos_ref_full - logp_neg_ref_full
             diff_full = d_theta_adj_full - d_ref_full
 
             # incorporate dataset margin ΔQ
             delta_q_tensor = torch.tensor([min(max(d, -1.0), 1.0) for d in delta_q_list], dtype=torch.float32, device=device_t)
-            beta_val = (beta_target if global_step >= beta_warmup_steps else (beta_start + (beta_target - beta_start) * (global_step / max(1, beta_warmup_steps))))
-            scaled_full = beta_val * (diff_full - gamma_margin * delta_q_tensor)
+            scaled_full = (beta_target if global_step >= beta_warmup_steps else (beta_start + (beta_target - beta_start) * (global_step / max(1, beta_warmup_steps)))) * (diff_full - gamma_margin * delta_q_tensor)
             scaled_full = torch.clamp(scaled_full, min=-50.0, max=50.0)
             per_example_loss_full = -F.logsigmoid(scaled_full)
             loss_full = per_example_loss_full.mean()
@@ -696,21 +671,7 @@ def train(
             else:
                 cons_penalty = torch.tensor(0.0, device=device_t)
 
-            # EOS missing penalty: check pos_lists and neg_lists (raw token lists returned earlier)
-            eos_pen = 0.0
-            if eos_id is not None:
-                missing = 0.0
-                for ids in pos_lists:
-                    if len(ids) == 0 or ids[-1] != eos_id:
-                        missing += 1.0
-                for ids in neg_lists:
-                    if len(ids) == 0 or ids[-1] != eos_id:
-                        missing += 1.0
-                total_checked = max(1.0, float(len(pos_lists) + len(neg_lists)))
-                eos_pen = (missing / total_checked)
-            cons_penalty = cons_penalty + eos_pen * eos_penalty_weight
-
-            # Flag-based downweighting
+            # flag-based downweighting: compute avg weight
             avg_flag_weight = 0.0
             for flags in flags_batch:
                 w = 1.0
@@ -727,35 +688,20 @@ def train(
                 avg_flag_weight = 1.0
 
             raw_loss = (alpha_dpo * loss_full) * avg_flag_weight + constraint_penalty_weight * cons_penalty
-
-            # optional tokenwise KL anchor between theta and ref on generation tokens
-            if anchor_coeff and anchor_coeff > 0.0:
-                # compute p_ref and logp_theta
-                with torch.no_grad():
-                    # logits_both_ref_full is already computed and on device_t
-                    pass
-                # careful: logits could be float16 -- cast to float32 for stable softmax
-                logp_theta_all = F.log_softmax(logits_both_theta_full.float(), dim=-1)
-                p_ref_all = F.softmax(logits_both_ref_full.float(), dim=-1)
-                kl_per_token = (p_ref_all * (torch.log(torch.clamp(p_ref_all, 1e-9)) - logp_theta_all)).sum(dim=-1)  # [B, T]
-                # build generation mask same as earlier (shifted)
-                B_mask, T_mask = input_ids_both_full.size()
-                # We need a mask shaped [B, T-1] for token positions corresponding to labels
-                gen_mask = torch.zeros((B_mask, T_mask-1), device=device_t, dtype=torch.float32)
-                for bi, pl in enumerate(prompt_lens_both_full):
-                    start = max(int(pl.item()) - 1, 0)
-                    if start < (T_mask - 1):
-                        gen_mask[bi, start:] = 1.0
-                # align kl_per_token to labels: remove last time-step to match (we computed kl per token)
-                kl_for_labels = kl_per_token[:, :-1]  # shape [B, T-1]
-                masked_kl = (kl_for_labels * gen_mask).sum() / max(1.0, gen_mask.sum())
-                raw_loss = raw_loss + anchor_coeff * masked_kl
-
             if use_ard_lora and l1_lambda > 0:
                 raw_loss = raw_loss + lora_l1_penalty(constr_model, l1_lambda)
 
             if not torch.isfinite(raw_loss):
                 pbar.set_postfix({'dpo_raw_loss': float('nan')}); continue
+
+            # diagnostics: compute average EOS logp pos vs neg for monitoring (cheap: uses already computed logits)
+            if eos_coef != 0.0:
+                eos_logps_both_theta = compute_eos_logps(logits_both_theta_full, attn_both_full, eos_id)
+                eos_pos_mean = float(eos_logps_both_theta[:B_full].mean().detach().cpu())
+                eos_neg_mean = float(eos_logps_both_theta[B_full:].mean().detach().cpu())
+            else:
+                eos_pos_mean = None; eos_neg_mean = None
+
             loss_to_backward = raw_loss / max(1, grad_accum_steps)
             if device_t.type == 'cuda':
                 scaler.scale(loss_to_backward).backward()
@@ -776,7 +722,7 @@ def train(
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 dpo_opt_steps += 1
-                # occasional EMA update (optional)
+                # occasional EMA update (optional) -- light touch
                 if (dpo_opt_steps % ema_update_every) == 0:
                     try:
                         with torch.no_grad():
@@ -790,33 +736,17 @@ def train(
                         pass
 
             global_step += 1
-
-            # debug eos diagnostics: compute P_theta(eos | prompt) for first pos example (if requested)
-            if debug_eos:
-                try:
-                    with torch.no_grad():
-                        # first example logit matrix (theta)
-                        logits_first = logits_both_theta_full[0].float()  # [T, V]
-                        pl_first = int(prompt_lens_both_full[0].item())
-                        eos_logp = None
-                        if eos_id is not None and pl_first > 0:
-                            idx = pl_first - 1
-                            if 0 <= idx < logits_first.size(0):
-                                eos_logp = F.log_softmax(logits_first, dim=-1)[idx, eos_id].item()
-                        pbar.set_postfix({'dpo_raw_loss': float(raw_loss.detach().cpu()), 'beta': float(beta_val), 'eos_logp_first': eos_logp})
-                except Exception:
-                    pbar.set_postfix({'dpo_raw_loss': float(raw_loss.detach().cpu()), 'beta': float(beta_val)})
-            else:
-                pbar.set_postfix({'dpo_raw_loss': float(raw_loss.detach().cpu()), 'beta': float(beta_val)})
-
+            postfix = {'dpo_raw_loss': float(raw_loss.detach().cpu()), 'beta': float(beta_target)}
+            if eos_pos_mean is not None:
+                postfix['eos_pos'] = eos_pos_mean; postfix['eos_neg'] = eos_neg_mean
+            pbar.set_postfix(postfix)
             if device_t.type == 'cuda':
                 torch.cuda.empty_cache()
 
         epoch_dir = os.path.join(out_dir, f'dpo_epoch{epoch}')
         os.makedirs(epoch_dir, exist_ok=True)
         try:
-            constr_model.model.save_pretrained(epoch_dir)
-            tokenizer.save_pretrained(epoch_dir)
+            constr_model.model.save_pretrained(epoch_dir); tokenizer.save_pretrained(epoch_dir)
             torch.save({'head_state': constr_model.head.state_dict()}, os.path.join(epoch_dir, 'constraint_head.pt'))
         except Exception:
             torch.save({k:v.cpu() for k,v in constr_model.state_dict().items()}, os.path.join(epoch_dir, 'full_state.pt'))
@@ -828,37 +758,37 @@ def train(
 # -------------------------
 # CLI
 # -------------------------
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--data', type=str, default='clone.jsonl')
-    p.add_argument('--out_dir', type=str, default='out_trainer3_with_eos')
+    p.add_argument('--out_dir', type=str, default='out_trainer3_old')
     p.add_argument('--model', type=str, default='Qwen/Qwen2.5-1.5B-Instruct')
     p.add_argument('--epochs_sft', type=int, default=1)
-    p.add_argument('--epochs_dpo', type=int, default=2)
+    p.add_argument('--epochs_dpo', type=int, default=1)
     p.add_argument('--batch_size', type=int, default=1)
-    p.add_argument('--lr', type=float, default=5e-5)
+    p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--constraint_k', type=int, default=6)
     p.add_argument('--alpha_sft', type=float, default=0.2)
     p.add_argument('--alpha_dpo', type=float, default=0.5)
-    p.add_argument('--beta_start', type=float, default=0.05)
-    p.add_argument('--beta_target', type=float, default=0.10)
-    p.add_argument('--beta_warmup_steps', type=int, default=500)
+    p.add_argument('--beta_start', type=float, default=0.1)
+    p.add_argument('--beta_target', type=float, default=0.15)
+    p.add_argument('--beta_warmup_steps', type=int, default=350)
     p.add_argument('--lambda_v', type=float, default=0.7)
-    p.add_argument('--lora_r', type=int, default=4)
-    p.add_argument('--lora_alpha', type=int, default=16)
+    p.add_argument('--lora_r', type=int, default=8)
+    p.add_argument('--lora_alpha', type=int, default=32)
     p.add_argument('--lora_dropout', type=float, default=0.05)
     p.add_argument('--quant_bits', type=int, default=4, choices=[4,8,16])
-    p.add_argument('--grad_ckpt', default=True)
-    p.add_argument('--ref_on_cpu', default=False)
+    p.add_argument('--grad_ckpt', action='store_true')
+    p.add_argument('--ref_on_cpu', action='store_true')
     p.add_argument('--gamma_margin', type=float, default=1.0, help='scale of ΔQ margin inside DPO')
-    p.add_argument('--constraint_penalty_weight', type=float, default=0.5)
-    p.add_argument('--use_ard_lora', default=True, help='Enable ARD L1 on LoRA params')
-    p.add_argument('--l1_lambda', type=float, default=5e-7)
-    p.add_argument('--eos_penalty_weight', type=float, default=0.1)
-    p.add_argument('--debug_eos', default=True)
-    p.add_argument('--anchor_coeff', type=float, default=0.01, help='Token-KL anchor coefficient (0 disables)')
+    p.add_argument('--constraint_penalty_weight', type=float, default=1.0)
+    p.add_argument('--use_ard_lora', default=True)
+    p.add_argument('--l1_lambda', type=float, default=1e-6)
+    p.add_argument('--eos_coef', type=float, default=1.0, help='weight of EOS logprob in DPO objective (0 to disable)')
     return p.parse_args()
+
 
 if __name__ == '__main__':
     args = parse_args()
@@ -888,7 +818,5 @@ if __name__ == '__main__':
         constraint_penalty_weight=args.constraint_penalty_weight,
         use_ard_lora=args.use_ard_lora,
         l1_lambda=args.l1_lambda,
-        eos_penalty_weight=args.eos_penalty_weight,
-        debug_eos=args.debug_eos,
-        anchor_coeff=args.anchor_coeff,
+        eos_coef=args.eos_coef,
     )

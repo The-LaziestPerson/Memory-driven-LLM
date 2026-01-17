@@ -261,7 +261,7 @@ def render_graph(G: nx.DiGraph, show_topics: List[int], show_claim_edges: bool, 
 st.set_page_config(layout="wide")
 st.title("Claim Graph (Revision-aware) Explorer")
 
-path = st.sidebar.text_input("Path to JSON", value="integrated_graph_revision_with_memoryjson")
+path = st.sidebar.text_input("Path to JSON", value="integrated_graph_revision_with_memory.json")
 
 if not os.path.exists(path):
     st.error("File not found: " + path)
@@ -332,4 +332,5 @@ try:
     os.remove(tmp_path)
 except Exception:
     pass
+
 
